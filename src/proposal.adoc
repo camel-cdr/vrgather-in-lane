@@ -1,9 +1,9 @@
-= Proposal: RISC-V Vector Register Gather Range HINT Extension Proposal
+= Proposal: RISC-V Vector in-lane Register Gather Extension Proposal
 Authors: Olaf Bernstein
 include::../docs-resources/global-config.adoc[]
 :docgroup: RISC-V Task Group
-:description: RISC-V Vector Register Gather Range HINT Extension Proposal
-:revnumber: 0.0.1
+:description: RISC-V Vector in-lane Register Gather Extension Proposal
+:revnumber: 0.0.2
 :revremark: Draft
 :revinfo:
 :preface-title: Preamble
@@ -32,7 +32,6 @@ include::../docs-resources/global-config.adoc[]
 :footnote:
 :xrefstyle: short
 
-
 [WARNING]
 .This document is in the link:http://riscv.org/spec-state[Development state]
 ====
@@ -58,13 +57,39 @@ Copyright 2025 by RISC-V International.
 //[%hardbreaks]
 
 
+// NOTE:
+// We want to cover three cases:
+// A) The general one
+// B) LUT
+// C) constant shuffle
+//
+// (C) is done by vrgatherNei4.vx
+//
+//
+//
+// a vlut that goes down to a fixed MUL=1 source is to complex (also to use), because you need to replicate within the LMUL=1 register, but if you e.g. have vlut512.v on VLEN>=128, now you suddenly need to cover 4 vregs.
+// So there barely is an improvement.
+// vrgatherN.vv is simpler and also covers both cases. (may need extra vsetvl when unrolling)
+//
+// Defined for how many N?
+//
+// It seems like N<128, doesn't matter.
+// We should define 128/256/512/1024, as these work on standard "V" (VLEN>=128) and cover all types (8/16/32/64) for vrgatherNei4.vx.
+// Why not define all powers-of-two? long-vector/DLEN<<VLEN hardware will have to do something more clever for regular vrgather.vv anyway.
+// Why up to 1024, see above and it's also the largest AVX-512 can do.
+//
+// How should this handle vl? write back vl elements!
+// What should the behaviour for VLEN*LMUL<N be? Options A) undefinde/exception B) read fewer elements. (A)!!! I can't think of a use for (B) and (A) should help catch errors.
+//
+// Should it maybe be vrgather128ei4.vx, vrgathere8ei4.vx, vrgathere8.vx? I think the first is best!
+//
+// vrgather128ei4.vx is >RV64 only
+
+
 == Introduction
 
-The document proposes a new vrgather range HINT instruction, which allows hardware implementations to provide specialized implementations of in-lane shuffles.
-This is needed to be competitive with other contemporary SIMD/Vector ISAs, which have dedicated in-lane shuffle instructions.
-
-The proposed HINT closes this gap while maintaining backwards compatibility with the standard "V" extension, such that the HINT can be directly used in code targeting the base "V" extension.
-Further, it provides a fully general solution that works for all lane sizes.
+The document proposes new in-lane vrgather variants, which allow hardware implementations to provide specialized implementations.
+This is needed to be competitive with other contemporary SIMD/Vector ISAs, which already have dedicated in-lane shuffle instructions.
 
 == Motivation and Rational
 
@@ -95,124 +120,194 @@ Looking at the different AVX-512 implementations in <<avx512>>, we can see that 
 
 | `vpshufb` | 1/2     | 1/2       | 1/2        | 1/2         | 2/2  | 2/2
 | `vpermb`  | 3/1     | 3/1       | 3/1        | 3/1         | 4/2  | 4/2
+| `vpermw`  | 3/1     | 3/1       | 3/1        | 3/1         | 4/2  | 4/2
 |===
 
+These latency and throughput improvements are the main motivation for this proposal.
+For implementations with a native gather primitive smaller than VLEN, adding hardware that ensures the gather primitive is only applied between lanes that are actually read from actually covers more shuffles than the proposed in-lane shuffles. It also achieves linear scaling for things like reverse or expanding/compressing-shuffles (e.g. base64 en/decode).
+While this is a great fit for long vector DLEN<VLEN architectures, this isn't really applicable for getting latency and throughput improvements in high-performance out-of-order application class processors, which usually implement a VLEN-wide gather primitive.
 
-While it's possible to detect when a general shuffle is used with non-lane-crossing indices at runtime, this is non-trivial, especially for high-performance out-of-order application class processors, and more suited for long vector DLEN<VLEN architectures.
-// this is more general, e.g. reverse, but only makes sense for DLEN<VLEN
-
-The problem with adding new in-lane vrgather variants is that they would see little use, as it would take many years to see them in hardware, let alone in the base profile targeted by operating systems.
-*Instead of new vrgather instructions, we can add new vrgather range HINT instructions, which are fully backwards compatible with the standard "V" extension.*
-
-To understand how the proposed vrgather range HINT instructions allow you to write backwards compatible code with optimized in-lane shuffles, we have to consider two usescases:
-
-1. SHUF: A general in-lane shuffle of elements.
-2. LUT: A fixed-size lookup table that may be smaller than the vector length.
-
-In the SHUF use case, the input vector elements are shuffled within fixed lanes.
-This is done using the full indices, so it produces the correct results without the HINT.
-The proposed vrgather range HINT now tells the hardware that it's allowed to only look at the lowest n-bits of the indices and apply the shuffle within the corresponding lanes.
-<<shuf>> and <<shuf_hint>> visualize the behavior and show how the result is the same.
+<<shuf>> to <<shuf_lane>> visualize how knowing the lane size simplifies the amount of work the shuffle has to do.
 
 [cols="a,a", frame=none, grid=none]
 |===
 |
 [[shuf]]
-.4-element SHUF example
+.VLEN=256 SEW=32 4-element vrgather.vv shuffle
 image::SHUF.svg[width=97%,align="left"]
 |
-[[shuf_hint]]
-.4-element SHUF example with HINT
-image::SHUF-HINT.svg[width=97%,align="right"]
+[[shuf_lane]]
+.VLEN=256 SEW=32 4-element vrgather128.vv shuffle
+image::SHUF-lane.svg[width=97%,align="right"]
 |===
 
-
-Compared to a dedicated in-lane vrgather instruction, the HINT allows for the same architectural optimizations. It may, however, require an additional instruction to set the ignored upper bits to correspond to the lane index for the case when the HINT is ignored.
-Fortunately, the most common applications of such SHUF operations have constant shuffle indices (see <<survey>>), and if that's not the case, it's trivial to constrict set the bits appropriately.
-Another small drawback of the HINT instruction is that for shuffles of 8-bit elements, you need to use 16-bit indices when VLEN>=2048. It's recommended to have two code paths, one for VLEN<2048 and one for VLEN>=2048 in such cases.
-These small drawbacks seem worth it, considering the huge advantage of backward compatibility.
-Additionally, both of these disadvantages don't apply to the LUT use case.
-
-In the LUT use case, the index elements are used to index the first n elements of the input vector as a fixed lookup table.
-Such operations are extremely common, especially in string processing, see <<survey>>.
-Currently this is implemented by simply gathering from the first n elements, and this can stay the same with the HINT instruction.
-The only difference is that you have to make sure to duplicate the lookup table to every input lane, as shown in <<lut>> and <<lut_hint>>.
-
+<<lut>> to <<lut_lane>> show how this applies to the common usage pattern of using register gather instructions to implement lookup-tables.
 
 [cols="a,a", frame=none, grid=none]
 |===
 |
 [[lut]]
-.4-element LUT example
+.VLEN=256 SEW=32 4-element vrgather.vv LUT
 image::LUT.svg[width=97%,align="left"]
 |
-[[lut_hint]]
-.4-element LUT example with HINT
-image::LUT-HINT.svg[width=97%,align="right"]
+[[lut_lane]]
+.VLEN=256 SEW=32 4-element vrgather128.vv LUT
+image::LUT-lane.svg[width=97%,align="right"]
 |===
 
-To summarize, we propose a new vrgather range HINT instruction to allow implementations to easily provide specialized implementations of in-lane shuffles while maintaining backward compatibility with the standard "V" extension.
-The HINT can be used in existing code running on existing processors, while a new vrgather instruction would take years to become available and then split the ecosystem.
-Compared to new dedicated in-lane vrgather variants, the HINT provides the same efficiency for the previously described LUT use case and only requires one additional instruction when used for the SHUF use case with dynamic indices.
+To summarize, we aim to propose new in-lane vrgather variants to allow implementations to easily provide specialized implementations of in-lane shuffles.
+
+== Design considerations
+
+[[lane_size]]
+=== Defining the lane size
+
+Should the lane size be defined based on the number of bits or the number of elements?
+
+It is important that, for the choosen definition of lane size, shuffles of N-wide lanes of different element widths have similar complexity, because RVV uses the same instruction encoding for different element width.
+
+Other ISAs define their in-lane shuffle instructions based on lane size.
+Most x86 and Arm processors don't report different latency or throughput for shuffles of different element widths (see <<avx512>>).
+So the lane size should be defined in terms of bits.
+
+=== Instruction semantics
+
+The usages of in-lane shuffles can be categorized in three categories:
+
+* lookup-table: The indices are variable, the values are constant, and the same values are in every lane.
+* static shuffle: The indices are constant and apply a constant permutation to the values.
+* dynamic shuffle: The indices and values are both variable, e.g. a different shuffle on every lane.
+
+<<survey>> indicates that the static shuffle use case is the most common, followed by the lookup-table use case, with dynamic shuffles seeing the least use.
+
+The static shuffle usage can be nicely covered using a vector-scalar in-lane register gather that encodes the shuffle indices that are applied to each lane in a single 64-bit GPR.
+Specifically, one can encode 16 4-bit indices in a 64-bit GPR, so this type of shuffle only works with 16 or fewer elements in each lane.
+This suggests an instruction that can shuffle 16 SEW wide elements within 16*SEW bit wide lanes.
+As discussed in <<lane_size>> however, we want to keep the lane size in bits constant for any given SEW.
+
+To facilitate this, we can instead define an N-bit wide vector-scalar vrgather variant (`vrgather<N>ei4.vx`), which ignores SEW and always shuffles N/16 bit wide elements.
+So `vrgather128ei4.vx` shuffles 16 8-bit elements in 128-bit lanes, while `vrgather512ei4.vx` shuffles 16 32-bit elements in 512-bit lanes regardless of SEW. +
+To make the result still usable, when N/16 != SEW, the instruction operates under EEW=N/16, EMUL=LMUL and EVL=(VL*SEW+EEW-1)/EEW.
+This has the great knock-on effect of allowing type punning without two additional vl and vtype changing  `vsetvli` instructions, which can be quite handy in complex SIMD code.
+
+We want to address the other usages with vector-vector in-lane register gather variants.
+The instructions should only shuffle within N-bit lanes and use the significant lower bits of the indices in corresponding lanes to control the shuffles.
+The upper index bits should be implicitly masked out to better support the lookup-table use case, which would otherwise often need an additional AND operation.
+
+One additional thing to consider is how the instructions deal with LMUL>1.
+
+For the lookup-table usage, it would be nice if the instructions always read an EMUL=1 value vector, as this would save vector registers compared to LMUL=EMUL and still produce the same result.
+You could still use such an instruction to implement LMUL>1 dynamic shuffles, by executing multiple LMUL=1 instructions and temporarily adjusting vl and vtype.
+The same could be done with a EMUL=LMUL variant, if you want to use it to implement a lookup-table and save vector registers.
+Considering that the lookup-table usage seems to be more common than the dynamic shuffle one, the EMUL=1 value vector register source could be a good idea.
+
+It does, however, run into problems when the lane size is larger than VLEN, in which case you EMUL=1 wouldn't be enough.
+It also would be a new type of operation with different register dependencies than in currently defined instructions.
+
+So in an effort of simplicity and to cover all usages, a simple vector-vector in-lane vrgather (`vrgather<N>.vv`) design with EMUL=LMUL was chosen.
 
 
 == Proposed Instructions
 
-=== vp2rangei
+=== vrgather<N>.vv
 
 Synopsis::
-Vector Register Gather Range HINT
+N-bit in-lane vector register gather (128-bit, 256-bit, 512-bit and 1024-bit)
 
-Mnemonic::
-vp2rangei imm +
+Mnemonics::
+vrgather128.vv  vd, vs2, vs1, vm +
+vrgather256.vv  vd, vs2, vs1, vm +
+vrgather512.vv  vd, vs2, vs1, vm +
+vrgather1024.vv vd, vs2, vs1, vm
+
 
 Encoding::
 [wavedrom, , svg]
 ....
 {reg:[
-{bits: 7, name: 'OP-IMM' },
-{bits: 5, name: 'rd=x0' },
-{bits: 3, name: 'opcode'},
-{bits: 5, name: 'rs1=x0' },
-{bits: 4, name: 'imm[3:0]' },
-{bits: 8, name: 0x0 }
+{bits: 7, name: 'OP-V' },
+{bits: 5, name: 'vd' },
+{bits: 3, name: 'OPIVV' },
+{bits: 5, name: 'vs1' },
+{bits: 5, name: 'vs2' },
+{bits: 7, name: 'opcode' }
 ]}
 ....
 
 
 Description::
-Provide a HINT to hardware that it is allowed to execute the immediately subsequent `vrgather.vv` or `vrgatherei16.vv` instruction by only considering the lowest N index bits and gathering from adjacent lanes.
-E.g. for `vl=16` and `vp2rangei imm=3`, hardware is allowed to gather the first `8=1<<imm` destination elements vector from indices 0 to 7 of the source vector and destination elements 8 to 15 from the indices 8 to 15 of the source vector.
+The in-lane vector register gather instructions are register gather instruction that read elements from N-bit lanes of a first source vector register group at locations, within the lanes, given by the corresponding lanes of a second vector source register group.
+The index values are taken from the lowest N/SEW bits of the elements in the second vector.
+The source vector can be read at any index from within a lane regardless of vl.
 
-[NOTE]
-====
-It's the responsibility of software to meet the preconditions that ensure the behavior is the same when the HINT is ignored or handled by hardware.
-Two common uses are a) the source lanes are all equivalent (e.g. lookup table) b) the indices only read from the corresponding lanes (in-lane shuffle).
-====
 
 Operation::
 [source,sail]
 --
-// updated vrgather.vv/vrgatherei16.vv index computation
-var idx = unsigned(vs1_val[i]);
-if (range_hints_enabled && has_range_hint) {
-    let mask = (1 << range_hint_imm) - 1;
-    idx = (idx & mask) | (i & ~mask);
-}
+if (vs1 == vd | vs2 == vd) then return Illegal_Instruction();
+let idx = i/16*SEW + unsigned(vs1_val[i][N/SEW-1 .. 0]);
+if idx < VLMAX then vs2_val[idx] else zeros();
 --
+
+=== vrgather<N>ei4.vx
+
+Synopsis::
+N-bit in-lane vector-scalar register gather (128-bit, 256-bit, 512-bit and 1024-bit)
+
+Mnemonics::
+vrgather128ei4.vx vd, vs2, rs1, vm +
+vrgather256ei4.vx vd, vs2, rs1, vm +
+vrgather512ei4.vx vd, vs2, rs1, vm +
+vrgather1024ei4.vx vd, vs2, rs1, vm
+
+Encoding::
+[wavedrom, , svg]
+....
+{reg:[
+{bits: 7, name: 'OP-V' },
+{bits: 5, name: 'vd' },
+{bits: 3, name: 'OPIVX' },
+{bits: 5, name: 'rs1' },
+{bits: 5, name: 'vs2' },
+{bits: 7, name: 'opcode' }
+]}
+....
+
+Description::
+The in-lane vector-scalar register gather instructions are vector register gather instructions that read elements from N-bit lanes of a source vector register group at locations within the lanes, given by the 16 4-bit indices encoded in the scalar register.
+The source vector can be read at any index from within a lane regardless of vl.
+The instructions operate at a EEW=N/16, EMUL=LMUL, EVL=(VL*SEW+EEW-1)/EEW, enabling efficient type punning.
+
+[NOTE]
+====
+Software should prefer the variant with the smallest lane for a given shuffle, even if EEW doesn't match the element width it want to operate on.
+For example, duplicating the first 32-bit element in lanes of four 32-bit elements, so 128-bit lanes, can be accomplished with vrgather128ei4.vx and a scalar register with the value 0x3210321032103210.
+====
+
+
+Operation::
+[source,sail]
+--
+let EEW = N/16;
+let EMUL = LMUL;
+let EVL = (VL*SEW+EEW-1)/EEW;
+if (vs1 == vd) then return Illegal_Instruction();
+let idx = i/16*EEW + unsigned(vs1_val[i%16*4+4 .. i%16*4]);
+if idx < VLMAX then vs2_val[idx] else zeros();
+--
+
 
 [bibliography]
 == Bibliography
 
 bibliography::[]
 
-
 [[survey]]
 [appendix]
 == Usage survey
 
 The goal of this survey is to quanitify the usage of in-lane shuffles in existing SIMD code.
-
+It was conducted by inspecting various open source codebases by hand.
 
 [[occur]]
 .`vpermb`/`vpshufb` occurrences in open-source codebases
@@ -232,13 +327,13 @@ The goal of this survey is to quanitify the usage of in-lane shuffles in existin
 [%autowidth, cols="<1,^1,^1,^1", options="header"]
 [.center]
 |===
-| `vpshufb` usage | LUT | constant SHUF | dynamic SHUF
+| `vpshufb` usage | LUT | constant-shuffle | dynamic-shuffle
 
-| ffmpeg          | 14  | 168           | 0
-| simdutf         | 20  | 64            | 7
-| simdjson        | 8   | 0             | 2 (implements `vcompress.vm`)
+| ffmpeg          | 14  | 168              | 0
+| simdutf         | 20  | 64               | 7
+| simdjson        | 8   | 0                | 2 (implements `vcompress.vm`)
 
 |===
 
-<<cat>> shows the rarity of the dynamic SHUF use case, which requires an additional instruction with the proposed HINT compared to a dedicated in-lane shuffle.
-The large amount of constant SHUF usage means we should separately also consider other instructions, like `vrgatherei4.vx` which stores 16 4-bit indices in a GPR.
+<<cat>> shows how common the different types of shuffles are.
+The large amount of constant-shuffle usage motivates the separate `vrgather<N>ei4.vx` instructions.
